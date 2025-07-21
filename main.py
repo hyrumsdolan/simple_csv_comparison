@@ -94,17 +94,23 @@ def _excel_engine() -> str:
 # 3️⃣  Core comparison logic
 # ---------------------------------------------------------------------------
 def build_comparison(extract_csv: pd.DataFrame, truth_json: dict) -> pd.DataFrame:
-    truth_items = truth_json.get("testData", truth_json)     # handle either layout
-    truth_lookup = {item["fileName"]: item for item in truth_items}
+    if isinstance(truth_json, dict):
+        truth_items = truth_json.get("testData", [])
+    elif isinstance(truth_json, list):
+        truth_items = truth_json
+    else:
+        truth_items = []
+
+    truth_lookup = {item.get("fileName", ""): item for item in truth_items}
 
     rows = []
     for _, row in extract_csv.iterrows():
         file_name = row.get("Assets", "")
-        truth = truth_lookup.get(file_name, {})
+        truth = truth_lookup.get(file_name)
 
         rec: dict[str, str] = {"File Name": file_name}
         for header, path in MAPPING.items():
-            truth_val   = _dig(truth, path)
+            truth_val = _dig(truth, path) if truth else ""
             extract_val = row.get(header, "")
 
             rec[f"Truth: {header}"]   = _normalize(truth_val)
