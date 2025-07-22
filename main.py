@@ -94,6 +94,11 @@ def _excel_engine() -> str:
 # 3️⃣  Core comparison logic
 # ---------------------------------------------------------------------------
 def build_comparison(extract_csv: pd.DataFrame, truth_json: dict) -> pd.DataFrame:
+    """
+    Build a side-by-side comparison DataFrame from an extract CSV and a truth JSON
+    object. The truth JSON is expected to be a list of records, where each record
+    contains a "METADATA" key that is a stringified JSON object.
+    """
     if isinstance(truth_json, dict):
         truth_items = truth_json.get("testData", [])
     elif isinstance(truth_json, list):
@@ -101,12 +106,61 @@ def build_comparison(extract_csv: pd.DataFrame, truth_json: dict) -> pd.DataFram
     else:
         truth_items = []
 
-    truth_lookup = {item.get("fileName", ""): item for item in truth_items}
+    def extract_base_filename(filename):
+        """Extract base filename by removing UUID suffix if present."""
+        if not filename:
+            return ""
+        # Remove UUID pattern: -xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        import re
+        # Pattern to match UUID at the end of filename before extension
+        uuid_pattern = r'-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(\.[^.]+)?$'
+        base_name = re.sub(uuid_pattern, r'\1', filename)
+        return base_name
+
+    truth_lookup = {}
+    for item in truth_items:
+        metadata_str = item.get("METADATA")
+        if not isinstance(metadata_str, str):
+            continue
+        try:
+            metadata_obj = json.loads(metadata_str)
+        except json.JSONDecodeError:
+            continue
+
+        original_file_name = metadata_obj.get("fileName")
+        new_file_name = item.get("NEW_FILE_NAME")
+        
+        if not original_file_name and not new_file_name:
+            continue
+
+        # Create a structured record that the rest of the script expects
+        truth_record = {
+            "fileName": original_file_name or new_file_name,
+            "contentType": item.get("NAME"),
+            "metaData": metadata_obj,
+        }
+        
+        # Primary matching should be on NEW_FILE_NAME since that's what appears in CSV
+        if new_file_name:
+            truth_lookup[new_file_name] = truth_record
+        
+        # Also add entries for original filename and base names for fallback matching
+        if original_file_name:
+            truth_lookup[original_file_name] = truth_record
+            truth_lookup[extract_base_filename(original_file_name)] = truth_record
+        
+        if new_file_name:
+            truth_lookup[extract_base_filename(new_file_name)] = truth_record
 
     rows = []
     for _, row in extract_csv.iterrows():
         file_name = row.get("Assets", "")
-        truth = truth_lookup.get(file_name)
+        base_file_name = extract_base_filename(file_name)
+        
+        # Try to find truth data using various matching strategies
+        truth = (truth_lookup.get(file_name) or 
+                truth_lookup.get(base_file_name) or 
+                None)
 
         rec: dict[str, str] = {"File Name": file_name}
         for header, path in MAPPING.items():
