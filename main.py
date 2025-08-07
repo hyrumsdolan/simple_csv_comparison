@@ -25,10 +25,10 @@ MAPPING: dict[str, tuple[str, ...]] = {
     "Content Type": ("contentType",),
     "Document Type": ("contentType",),
     "Name": ("metaData", "providerName"),
-    "Issuing Entity": ("metaData", "issuingAuthority"),
-    "Issued Date": ("metaData", "issueDate"),
-    "Expiration Date": ("metaData", "expirationDate"),
-    "State": ("metaData", "state"),
+    "Issuing Entity": ("metaData", "issuingAuthority|issuingEntity|issuer|issuingAgency|issuingOrganization"),
+    "Issued Date": ("metaData", "issueDate|issuedDate|dateIssued|issuedOn"),
+    "Expiration Date": ("metaData", "expirationDate|expireDate|expires|expDate"),
+    "State": ("metaData", "state|stateCode|issuingState|jurisdiction|stateAbbreviation"),
     "result_id": ("metaData", "resultsDate"),
     # All “sub-category” columns use the same JSON key
     "Education and Training Sub-Category": ("metaData", "subCategory"),
@@ -74,7 +74,16 @@ def _dig(data: dict, path: tuple[str, ...]):
     for key in path:
         if not isinstance(cur, dict):
             return ""
-        cur = cur.get(key, "")
+        # Support alternative keys separated by '|'
+        if "|" in key:
+            found = ""
+            for option in key.split("|"):
+                if option in cur:
+                    found = cur.get(option, "")
+                    break
+            cur = found
+        else:
+            cur = cur.get(key, "")
     return cur
 
 
@@ -110,14 +119,17 @@ def build_comparison(extract_csv: pd.DataFrame, truth_json: dict) -> pd.DataFram
         """Extract base filename by removing UUID suffix if present."""
         if not filename:
             return ""
-        # Remove UUID pattern: -xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
         import re
-        # Pattern to match UUID at the end of filename before extension
         uuid_pattern = r'-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(\.[^.]+)?$'
         base_name = re.sub(uuid_pattern, r'\1', filename)
         return base_name
 
-    truth_lookup = {}
+    def normalize_key(val: str) -> str:
+        return str(val).strip().lower() if val is not None else ""
+
+    truth_lookup: dict[str, dict] = {}
+    truth_by_name: dict[str, dict] = {}
+
     for item in truth_items:
         metadata_str = item.get("METADATA")
         if not isinstance(metadata_str, str):
@@ -127,50 +139,58 @@ def build_comparison(extract_csv: pd.DataFrame, truth_json: dict) -> pd.DataFram
         except json.JSONDecodeError:
             continue
 
-        original_file_name = metadata_obj.get("fileName")
-        new_file_name = item.get("NEW_FILE_NAME")
-        
-        if not original_file_name and not new_file_name:
+        original_file_name = metadata_obj.get("fileName") or metadata_obj.get("filename")
+        new_file_name = item.get("NEW_FILE_NAME") or metadata_obj.get("newFileName")
+        provider_name = metadata_obj.get("providerName")
+
+        if not original_file_name and not new_file_name and not provider_name:
             continue
 
-        # Create a structured record that the rest of the script expects
         truth_record = {
-            "fileName": original_file_name or new_file_name,
+            "fileName": original_file_name or new_file_name or "",
             "contentType": item.get("NAME"),
             "metaData": metadata_obj,
         }
-        
-        # Primary matching should be on NEW_FILE_NAME since that's what appears in CSV
+
+        # Primary match on NEW_FILE_NAME (CSV Assets uses this)
         if new_file_name:
             truth_lookup[new_file_name] = truth_record
-        
-        # Also add entries for original filename and base names for fallback matching
+            truth_lookup[extract_base_filename(new_file_name)] = truth_record
+
+        # Fallback matches on original names
         if original_file_name:
             truth_lookup[original_file_name] = truth_record
             truth_lookup[extract_base_filename(original_file_name)] = truth_record
-        
-        if new_file_name:
-            truth_lookup[extract_base_filename(new_file_name)] = truth_record
+
+        # Provider-name fallback lookup
+        if provider_name:
+            truth_by_name[normalize_key(provider_name)] = truth_record
 
     rows = []
     for _, row in extract_csv.iterrows():
         file_name = row.get("Assets", "")
         base_file_name = extract_base_filename(file_name)
-        
-        # Try to find truth data using various matching strategies
-        truth = (truth_lookup.get(file_name) or 
-                truth_lookup.get(base_file_name) or 
-                None)
+
+        # Try filename-based strategies
+        truth = (
+            truth_lookup.get(file_name)
+            or truth_lookup.get(base_file_name)
+        )
+
+        # Fallback: match by provider name when filenames don't line up
+        if truth is None:
+            csv_name = row.get("Name", "")
+            truth = truth_by_name.get(normalize_key(csv_name))
 
         rec: dict[str, str] = {"File Name": file_name}
         for header, path in MAPPING.items():
             truth_val = _dig(truth, path) if truth else ""
             extract_val = row.get(header, "")
 
-            rec[f"Truth: {header}"]   = _normalize(truth_val)
+            rec[f"Truth: {header}"] = _normalize(truth_val)
             rec[f"Extract: {header}"] = _normalize(extract_val)
-            rec[f"{header} Match?"]   = _is_match(truth_val, extract_val)
-            rec["  "] = ""            # spacer column (appears blank in Excel)
+            rec[f"{header} Match?"] = _is_match(truth_val, extract_val)
+            rec["  "] = ""
 
         rows.append(rec)
 
@@ -205,6 +225,13 @@ if build_btn:
         truth_json  = json.load(json_file)
         extract_df  = pd.read_csv(csv_file, dtype=str)
         comparison  = build_comparison(extract_df, truth_json)
+
+        # Diagnostics: show match coverage
+        truth_cols = [c for c in comparison.columns if c.startswith("Truth: ")]
+        matched_mask = (comparison[truth_cols] != "").any(axis=1) if truth_cols else pd.Series([], dtype=bool)
+        num_rows = len(comparison)
+        num_matched = int(matched_mask.sum()) if num_rows else 0
+        st.write(f"Matched rows: {num_matched} / {num_rows}")
 
         # Write Excel to memory
         output_bytes = io.BytesIO()
