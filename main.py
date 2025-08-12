@@ -131,12 +131,18 @@ def build_comparison(extract_csv: pd.DataFrame, truth_json: dict) -> pd.DataFram
     truth_by_name: dict[str, dict] = {}
 
     for item in truth_items:
-        metadata_str = item.get("METADATA")
-        if not isinstance(metadata_str, str):
-            continue
-        try:
-            metadata_obj = json.loads(metadata_str)
-        except json.JSONDecodeError:
+        metadata_raw = item.get("METADATA")
+        if isinstance(metadata_raw, str):
+            # Case 1: METADATA is a stringified JSON object (original behavior)
+            try:
+                metadata_obj = json.loads(metadata_raw)
+            except json.JSONDecodeError:
+                continue
+        elif isinstance(metadata_raw, dict):
+            # Case 2: METADATA is already a dictionary object (your case)
+            metadata_obj = metadata_raw
+        else:
+            # Case 3: METADATA is neither string nor dict, skip
             continue
 
         original_file_name = metadata_obj.get("fileName") or metadata_obj.get("filename")
